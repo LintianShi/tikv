@@ -1608,7 +1608,9 @@ where
     ) {
         let mut now = None;
         let std_now = Instant::now();
-        for msg in msgs {
+        let zone_info = ctx.zone_info.read().unwrap();
+        let leader_az = zone_info.get(&self.peer.store_id);
+        for mut msg in msgs {
             let msg_type = msg.get_message().get_msg_type();
             if msg_type == MessageType::MsgSnapshot {
                 let snap_index = msg.get_message().get_snapshot().get_metadata().get_index();
@@ -1661,6 +1663,15 @@ where
                 }
             }
 
+            let to_az = zone_info.get(&to_store_id);
+            let mut is_cross_az: bool = true;
+            if !to_az.is_none() && !leader_az.is_none() {
+                if to_az.unwrap() == leader_az.unwrap() {
+                    is_cross_az = false;
+                }
+            }
+            msg.set_is_cross_az(is_cross_az);
+
             if let Err(e) = ctx.trans.send(msg) {
                 // We use metrics to observe failure on production.
                 debug!(
@@ -1699,7 +1710,6 @@ where
             if self.raft_group.is_recent_active(peer_id)
                 && self.raft_group.get_next_idx(peer_id).unwrap() > next_idx
                 && is_voter
-                && is_replicate_state
             {
                 agent_id = Some(peer_id);
                 next_idx = self.raft_group.get_next_idx(peer_id).unwrap();
@@ -1786,14 +1796,16 @@ where
         // Record message that should be discarded after merge_msg_append.
         let mut discard: HashSet<usize> = HashSet::default();
 
-        // Build MsgGroupBroadcast.
-        for (zone, group) in msg_append_group.iter() {
-            debug!("Zone name: {}, group info: {:?}", zone, group);
-            if group.len() > 1 {
-                self.merge_msg_append(group, &mut msgs, &mut discard);
+        if self.follower_repl() {
+            // Build MsgGroupBroadcast.
+            for (zone, group) in msg_append_group.iter() {
+                debug!("Zone name: {}, group info: {:?}", zone, group);
+                if group.len() > 1 {
+                    self.merge_msg_append(group, &mut msgs, &mut discard);
+                }
             }
         }
-
+        
         let mut pos: usize = 0;
         for msg in msgs {
             if discard.contains(&pos) {
